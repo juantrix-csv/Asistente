@@ -1,13 +1,15 @@
-# Asistente - Bloque 4
+# Asistente - Bloque 9
 
 Monorepo con FastAPI, Postgres, Alembic, WAHA y Google Calendar.
 
 ## Requisitos
 - Docker Desktop
 - Python 3.11
+- Postgres con pgvector (el docker-compose ya usa `pgvector/pgvector`)
 
 ## Estructura
 - `apps/api` FastAPI
+- `apps/worker` worker proactivo
 - `packages/db` SQLAlchemy + Alembic
 - `infra/docker-compose.yml` infraestructura
 
@@ -73,6 +75,67 @@ Alternativa manual (si el callback no funciona):
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://localhost:8000/auth/google/finish -ContentType 'application/json' -Body '{"code":"TU_CODE"}'
 ```
+
+## Worker (proactividad)
+- Servicio `worker` con APScheduler y tick cada 2 minutos.
+- Consulta eventos entre ahora y +2 horas y tareas que vencen hoy.
+- Ventana proactiva fuerte: 11:00-19:00. Quiet hours: 00:00-09:30.
+- Cooldown por trigger y rate limit diario (config en `system_config`).
+- Digest diario a las 21:00 con items digeridos (max 10).
+- Usa `USER_CHAT_ID` si esta definido (fallback a `PROACTIVE_CHAT_ID` o ultimo contacto).
+ - El digest incluye una seccion "Para mejorar" con requests abiertos de alta prioridad.
+
+Comandos por WhatsApp:
+- `modo foco X horas` / `no me jodas X horas`
+- `solo urgencias`
+- `normal`
+- `status proactivo`
+
+## Memoria (Bloque 7)
+- La ingesta de WhatsApp crea `memory_chunks` (1 mensaje = 1 chunk).
+- Busqueda por tags + texto, con embeddings opcionales via pgvector.
+
+Variables:
+- `EMBEDDINGS_MODE=off|fake|local`
+- `EMBEDDINGS_MODEL` (si usas `local`, default `all-MiniLM-L6-v2`)
+  - `local` usa `sentence-transformers` y descarga el modelo la primera vez.
+
+Ingesta manual:
+- `POST /memory/ingest/messages?since_hours=24`
+
+Busqueda:
+- `GET /memory/search?q=...&tag=fletes&tag=agenda&limit=8`
+
+## LLM Planner (Bloque 8)
+- Usa Ollama con modelo **qwen2.5:7b-instruct-q4** y salida JSON estricta.
+- El Supervisor valida riesgo, permisos y evidencia antes de ejecutar tools.
+
+Variables:
+- `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`)
+
+Notas:
+- El modelo es fijo en el codigo (no se usa otro).
+- Asegurate de tener Ollama corriendo localmente con el modelo descargado.
+
+Comandos de autonomia:
+- `autonomia on 2 horas para calendario`
+- `autonomia off`
+- `status autonomia`
+
+## Auto-ajuste (Bloque 9)
+- El sistema detecta faltantes y crea requests (1 pregunta concreta).
+- Solo pregunta 1 request por dia, en ventana fuerte, y respeta modo foco/urgencias.
+- Si respondes `omitir`, se silencia ese request por 30 dias.
+
+Requests actuales:
+- `authorize_calendar` -> autorizar Google Calendar.
+- `missing_default_contact` -> `default_barbershop`.
+- `missing_preference` -> `preferred_event_duration_minutes`.
+- `missing_address` -> `diet_store_address` (baja prioridad).
+- `missing_preference` -> `user_chat_id` (chat principal).
+
+Endpoints:
+- `GET /requests?status=open` para ver requests.
 
 ## Migraciones
 Con la DB levantada, podes ejecutar:

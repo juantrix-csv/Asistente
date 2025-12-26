@@ -106,6 +106,38 @@ def test_agent_focus_mode_sets_rule() -> None:
         assert rule.until_at is not None
 
 
+def test_autonomy_on_for_calendar() -> None:
+    result = handle_incoming_message(
+        chat_id="chat-6",
+        sender_id="sender-6",
+        text="autonomia on 2 horas para calendario",
+        sender_name="Juan",
+        raw_payload={},
+    )
+
+    assert "Autonomia activada" in result.reply_text
+
+    with SessionLocal() as session:
+        rule = (
+            session.query(AutonomyRule)
+            .filter_by(scope="calendar_create", mode="on")
+            .one()
+        )
+        assert rule.until_at is not None
+
+
+def test_autonomy_status() -> None:
+    result = handle_incoming_message(
+        chat_id="chat-7",
+        sender_id="sender-7",
+        text="status autonomia",
+        sender_name="Juan",
+        raw_payload={},
+    )
+
+    assert "Autonomia" in result.reply_text
+
+
 def test_agent_conflict_proposes_alternatives(monkeypatch) -> None:
     monkeypatch.setattr(core.CalendarTool, "has_token", lambda self: True)
 

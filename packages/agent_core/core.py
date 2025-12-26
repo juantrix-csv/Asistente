@@ -10,8 +10,32 @@ from zoneinfo import ZoneInfo
 
 from packages.agent_core.tools.calendar_tool import CalendarNotAuthorized, CalendarTool
 from packages.agent_core.tools.google_oauth import OAuthConfigError
+from packages.assistant_requests import (
+    NeedsDetector,
+    RequestPolicy,
+    count_requests_asked_today,
+    get_active_request,
+    get_open_requests,
+    mark_request_answered,
+    mark_request_asked,
+    mark_request_dismissed,
+    upsert_fact,
+)
 from packages.db.database import SessionLocal
-from packages.db.models import AutonomyRule, ConversationState
+from packages.db.models import (
+    AssistantRequest,
+    AutonomyRule,
+    ConversationState,
+    MemoryFact,
+    SystemConfig,
+    ToolRun,
+)
+from packages.llm.client import LlmClient, load_llm_config
+from packages.llm.context_builder import ContextBuilder
+from packages.llm.supervisor import Supervisor
+from packages.llm.tools_registry import execute_tool, get_tool_scope, get_tool_names
+from packages.memory.service import MemoryRetriever
+from packages.memory.tagger import extract_tags
 
 TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 
@@ -56,9 +80,13 @@ def handle_incoming_message(
             return AgentResult(reply_text="Listo, cancelado.")
 
         if folded and state.pending_action_json and folded in CONFIRM_COMMANDS:
-            result = _confirm_pending_action(session, state)
+            result = _confirm_pending_action(session, state, chat_id)
             if result:
                 return result
+
+        request_answer = _handle_assistant_request_answer(session, chat_id, normalized, folded)
+        if request_answer:
+            return request_answer
 
         focus_result = _handle_focus_commands(session, state, folded)
         if focus_result:
@@ -73,48 +101,84 @@ def handle_incoming_message(
             return AgentResult(reply_text="Tenes un plan pendiente. Escribi confirmo o cancelar.")
 
         list_request = _parse_list_request(normalized)
+        if list_request and _calendar_auth_missing():
+            state.last_intent = "needs_auth"
+            reply = _handle_calendar_auth_needed(session, chat_id)
+            return AgentResult(reply_text=reply)
         if list_request:
-            return _handle_list_request(list_request)
+            return _handle_list_request(session, chat_id, list_request)
 
         schedule_request = _parse_schedule_request(normalized)
+
+        tags = extract_tags(normalized)
+        memory_result = _handle_memory_request(
+            session, normalized, folded, tags, chat_id, schedule_request
+        )
+        if memory_result:
+            return memory_result
+
         if schedule_request:
-            return _handle_schedule_request(session, state, schedule_request)
+            if schedule_request.get("start_dt") and schedule_request.get("duration_minutes"):
+                if _calendar_auth_missing():
+                    state.last_intent = "needs_auth"
+                    reply = _handle_calendar_auth_needed(session, chat_id)
+                    return AgentResult(reply_text=reply)
+            return _handle_schedule_request(session, state, schedule_request, chat_id)
+
+        llm_result = _handle_llm_planner(session, state, normalized, chat_id)
+        if llm_result:
+            return llm_result
+
+        request_prompt = _maybe_ask_request(session, state, chat_id, normalized)
+        if request_prompt:
+            return AgentResult(reply_text=request_prompt)
 
     return AgentResult(reply_text="Recibi tu mensaje")
 
 
 def _handle_schedule_request(
-    session, state: ConversationState, request: dict[str, Any]
+    session, state: ConversationState, request: dict[str, Any], chat_id: str
 ) -> AgentResult:
     title = request["title"]
     start_dt: datetime | None = request.get("start_dt")
     duration = request.get("duration_minutes")
+    location = request.get("location")
 
     if start_dt is None:
         state.pending_question_json = {
             "type": "start_time",
             "title": title,
             "duration_minutes": duration,
+            "location": location,
+            "chat_id": chat_id,
         }
         state.last_intent = "calendar_schedule"
         session.commit()
-        return AgentResult(reply_text="Para que dia y hora? (ej: manana 16)")
+        reply = "Para que dia y hora? (ej: manana 16)"
+        if location:
+            reply = f"{reply} Voy a usar {location}."
+        return AgentResult(reply_text=reply)
 
     if duration is None:
         state.pending_question_json = {
             "type": "duration_minutes",
             "title": title,
             "start_dt": start_dt.isoformat(),
+            "location": location,
+            "chat_id": chat_id,
         }
         state.last_intent = "calendar_schedule"
         session.commit()
-        return AgentResult(reply_text="Cuanto dura? 30/60/90")
+        reply = "Cuanto dura? 30/60/90"
+        if location:
+            reply = f"{reply} Voy a usar {location}."
+        return AgentResult(reply_text=reply)
 
     calendar_tool = CalendarTool()
     if not calendar_tool.has_token():
         state.last_intent = "needs_auth"
         session.commit()
-        return AgentResult(reply_text=_auth_message())
+        return AgentResult(reply_text=_handle_calendar_auth_needed(session, chat_id))
 
     end_dt = start_dt + timedelta(minutes=duration)
     try:
@@ -136,6 +200,7 @@ def _handle_schedule_request(
                     }
                     for alt in alternatives
                 ],
+                "chat_id": chat_id,
             }
             state.last_intent = "calendar_schedule"
             session.commit()
@@ -148,7 +213,7 @@ def _handle_schedule_request(
     except CalendarNotAuthorized:
         state.last_intent = "needs_auth"
         session.commit()
-        return AgentResult(reply_text=_auth_message())
+        return AgentResult(reply_text=_handle_calendar_auth_needed(session, chat_id))
     except OAuthConfigError:
         state.last_intent = "config_error"
         session.commit()
@@ -161,6 +226,7 @@ def _handle_schedule_request(
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
             "timezone": TIMEZONE.key,
+            "location": location,
         },
     }
     state.pending_action_json = plan_payload
@@ -171,19 +237,19 @@ def _handle_schedule_request(
     return AgentResult(reply_text=_build_plan_text(plan_payload["payload"]))
 
 
-def _handle_list_request(request: dict[str, Any]) -> AgentResult:
+def _handle_list_request(session, chat_id: str, request: dict[str, Any]) -> AgentResult:
     day = request["day"]
     start_dt = datetime.combine(day, time(0, 0), tzinfo=TIMEZONE)
     end_dt = start_dt + timedelta(days=1)
 
     calendar_tool = CalendarTool()
     if not calendar_tool.has_token():
-        return AgentResult(reply_text=_auth_message())
+        return AgentResult(reply_text=_handle_calendar_auth_needed(session, chat_id))
 
     try:
         events = calendar_tool.list_events(start_dt, end_dt)
     except CalendarNotAuthorized:
-        return AgentResult(reply_text=_auth_message())
+        return AgentResult(reply_text=_handle_calendar_auth_needed(session, chat_id))
     except OAuthConfigError:
         return AgentResult(reply_text="Falta configurar Google Calendar.")
 
@@ -221,10 +287,11 @@ def _handle_pending_question(
             "title": question.get("title") or "Sin titulo",
             "start_dt": start_dt,
             "duration_minutes": duration,
+            "location": question.get("location"),
         }
         state.pending_question_json = None
         session.commit()
-        return _handle_schedule_request(session, state, request)
+        return _handle_schedule_request(session, state, request, question.get("chat_id") or "")
 
     if q_type == "start_time":
         start_dt = _parse_datetime(normalized)
@@ -237,15 +304,18 @@ def _handle_pending_question(
                 "title": question.get("title") or "Sin titulo",
                 "start_dt": start_dt,
                 "duration_minutes": duration,
+                "location": question.get("location"),
             }
             state.pending_question_json = None
             session.commit()
-            return _handle_schedule_request(session, state, request)
+            return _handle_schedule_request(session, state, request, question.get("chat_id") or "")
 
         state.pending_question_json = {
             "type": "duration_minutes",
             "title": question.get("title") or "Sin titulo",
             "start_dt": start_dt.isoformat(),
+            "location": question.get("location"),
+            "chat_id": question.get("chat_id"),
         }
         state.last_intent = "calendar_schedule"
         session.commit()
@@ -265,6 +335,7 @@ def _handle_pending_question(
                 "start": option.get("start"),
                 "end": option.get("end"),
                 "timezone": TIMEZONE.key,
+                "location": question.get("location"),
             },
         }
         state.pending_question_json = None
@@ -284,12 +355,107 @@ def _handle_pending_question(
         session.commit()
         return AgentResult(reply_text=f"Modo foco activado por {hours} horas.")
 
+    if q_type == "autonomy_hours":
+        hours = _parse_int(normalized)
+        if hours is None:
+            return AgentResult(reply_text="Por cuantas horas?")
+        scope = question.get("scope") or "calendar_create"
+        _create_autonomy_rule(session, scope=scope, mode="on", hours=hours)
+        state.pending_action_json = None
+        state.pending_question_json = None
+        state.last_intent = "autonomy_on"
+        session.commit()
+        return AgentResult(reply_text=f"Autonomia activada para {scope} por {hours} horas.")
+
     state.pending_question_json = None
     session.commit()
     return None
 
 
-def _confirm_pending_action(session, state: ConversationState) -> AgentResult | None:
+def _handle_assistant_request_answer(
+    session, chat_id: str, normalized: str, folded: str | None
+) -> AgentResult | None:
+    if not folded:
+        return None
+
+    request = get_active_request(session, chat_id)
+    if request is None:
+        return None
+
+    now_local = datetime.now(TIMEZONE)
+    if folded in {"omitir", "despues"}:
+        mark_request_dismissed(session, request, now_local)
+        session.commit()
+        return AgentResult(reply_text="Listo, lo dejo para mas tarde.")
+
+    if request.request_type == "authorize_calendar":
+        mark_request_answered(session, request, now_local)
+        session.commit()
+        return AgentResult(reply_text=_auth_message())
+
+    if request.key == "preferred_event_duration_minutes":
+        minutes = _parse_int(normalized)
+        if minutes is None:
+            return AgentResult(reply_text="Necesito un numero de minutos (30/60/90).")
+        upsert_fact(
+            session,
+            subject="user",
+            key="preferred_event_duration_minutes",
+            value=str(minutes),
+            confidence=80,
+            source_ref=f"request:{request.id}",
+        )
+        mark_request_answered(session, request, now_local)
+        session.commit()
+        return AgentResult(reply_text="Listo, lo guarde.")
+
+    if request.key == "default_barbershop":
+        upsert_fact(
+            session,
+            subject="user",
+            key="default_barbershop",
+            value=normalized,
+            confidence=80,
+            source_ref=f"request:{request.id}",
+        )
+        mark_request_answered(session, request, now_local)
+        session.commit()
+        return AgentResult(reply_text="Listo, lo guarde.")
+
+    if request.key == "diet_store_address":
+        upsert_fact(
+            session,
+            subject="user",
+            key="diet_store_address",
+            value=normalized,
+            confidence=70,
+            source_ref=f"request:{request.id}",
+        )
+        mark_request_answered(session, request, now_local)
+        session.commit()
+        return AgentResult(reply_text="Listo, lo guarde.")
+
+    if request.key == "user_chat_id":
+        upsert_fact(
+            session,
+            subject="user",
+            key="user_chat_id",
+            value=chat_id,
+            confidence=90,
+            source_ref=f"request:{request.id}",
+        )
+        mark_request_answered(session, request, now_local)
+        session.commit()
+        return AgentResult(reply_text="Listo, lo guarde.")
+
+    mark_request_answered(session, request, now_local)
+    session.commit()
+    return AgentResult(reply_text="Listo, lo guarde.")
+
+
+def _confirm_pending_action(
+    session, state: ConversationState, chat_id: str
+) -> AgentResult | None:
     pending = state.pending_action_json
     if not isinstance(pending, dict):
         state.pending_action_json = None
@@ -306,6 +472,8 @@ def _confirm_pending_action(session, state: ConversationState) -> AgentResult | 
     title = payload.get("title", "Sin titulo")
     start_dt = _parse_iso_datetime(payload.get("start"))
     end_dt = _parse_iso_datetime(payload.get("end"))
+    location = payload.get("location")
+    notes = payload.get("notes")
     if start_dt is None or end_dt is None:
         state.pending_action_json = None
         session.commit()
@@ -315,14 +483,14 @@ def _confirm_pending_action(session, state: ConversationState) -> AgentResult | 
     if not calendar_tool.has_token():
         state.last_intent = "needs_auth"
         session.commit()
-        return AgentResult(reply_text=_auth_message())
+        return AgentResult(reply_text=_handle_calendar_auth_needed(session, chat_id))
 
     try:
-        result = calendar_tool.create_event(title, start_dt, end_dt)
+        result = calendar_tool.create_event(title, start_dt, end_dt, location=location, notes=notes)
     except CalendarNotAuthorized:
         state.last_intent = "needs_auth"
         session.commit()
-        return AgentResult(reply_text=_auth_message())
+        return AgentResult(reply_text=_handle_calendar_auth_needed(session, chat_id))
     except OAuthConfigError:
         state.last_intent = "config_error"
         session.commit()
@@ -344,6 +512,54 @@ def _handle_focus_commands(
 ) -> AgentResult | None:
     if not folded:
         return None
+
+    if folded.startswith("autonomia on"):
+        scope = _parse_autonomy_scope(folded)
+        if scope is None:
+            return AgentResult(reply_text="Para que scope? calendario/mensajes/tareas")
+        hours = _parse_int(folded)
+        if hours is None:
+            state.pending_question_json = {"type": "autonomy_hours", "scope": scope}
+            state.last_intent = "autonomy_on"
+            session.commit()
+            return AgentResult(reply_text="Por cuantas horas?")
+        _create_autonomy_rule(session, scope=scope, mode="on", hours=hours)
+        state.pending_action_json = None
+        state.pending_question_json = None
+        state.last_intent = "autonomy_on"
+        session.commit()
+        return AgentResult(reply_text=f"Autonomia activada para {scope} por {hours} horas.")
+
+    if folded.startswith("autonomia off"):
+        scope = _parse_autonomy_scope(folded)
+        if scope:
+            _create_autonomy_rule(session, scope=scope, mode="off", hours=None)
+            reply = f"Autonomia desactivada para {scope}."
+        else:
+            for scope_name in ("calendar_create", "message_reply", "tasks_manage"):
+                _create_autonomy_rule(session, scope=scope_name, mode="off", hours=None)
+            reply = "Autonomia desactivada para todos los scopes."
+        state.pending_action_json = None
+        state.pending_question_json = None
+        state.last_intent = "autonomy_off"
+        session.commit()
+        return AgentResult(reply_text=reply)
+
+    if "status autonomia" in folded:
+        reply = _build_autonomy_status(session)
+        state.pending_action_json = None
+        state.pending_question_json = None
+        state.last_intent = "autonomy_status"
+        session.commit()
+        return AgentResult(reply_text=reply)
+
+    if "status proactivo" in folded:
+        reply = _build_proactive_status(session)
+        state.pending_action_json = None
+        state.pending_question_json = None
+        state.last_intent = "proactive_status"
+        session.commit()
+        return AgentResult(reply_text=reply)
 
     if folded.startswith("modo foco") or folded.startswith("no me jodas"):
         hours = _parse_int(folded)
@@ -550,11 +766,13 @@ def _build_plan_text(payload: dict[str, Any]) -> str:
     title = payload.get("title", "Sin titulo")
     start_dt = _parse_iso_datetime(payload.get("start"))
     end_dt = _parse_iso_datetime(payload.get("end"))
+    location = payload.get("location")
     if start_dt and end_dt:
         duration = int((end_dt - start_dt).total_seconds() / 60)
         start_text = _format_datetime(start_dt)
+        location_text = f" en {location}" if location else ""
         return (
-            f"Voy a agendar '{title}' el {start_text} por {duration} min. "
+            f"Voy a agendar '{title}' el {start_text}{location_text} por {duration} min. "
             "Confirmas? (si/confirmo)"
         )
     return "Confirmas? (si/confirmo)"
@@ -575,3 +793,436 @@ def _find_alternatives(calendar_tool: CalendarTool, start_dt: datetime, duration
 def _auth_message() -> str:
     base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
     return f"Necesito autorizacion de Google Calendar. Abri {base_url}/auth/google/start"
+
+
+def _handle_memory_request(
+    session,
+    normalized: str,
+    folded: str | None,
+    tags: list[str],
+    chat_id: str,
+    schedule_request: dict[str, Any] | None,
+) -> AgentResult | None:
+    if not folded or not tags:
+        return None
+
+    if "de siempre" in folded or "lugar de siempre" in folded:
+        fact = _find_fact_for_tags(session, tags)
+        if fact:
+            if schedule_request is not None:
+                schedule_request["location"] = fact.value
+                return None
+            return AgentResult(
+                reply_text=(
+                    f"Tengo registrado que el lugar de siempre es {fact.value}. "
+                    "Queres que lo use?"
+                )
+            )
+        now_local = datetime.now(TIMEZONE)
+        detector = NeedsDetector(session)
+        detector.scan(chat_id, now_local, user_text=normalized, intent_hint=None)
+        request = _get_request_by_key(session, "missing_default_contact", "default_barbershop", chat_id)
+        prompt = _ask_request_if_allowed(session, request, now_local)
+        if prompt:
+            return AgentResult(reply_text=prompt)
+        session.commit()
+        label = _tag_label(tags[0])
+        return AgentResult(
+            reply_text=f"Ok, cuando quieras decime el {label} de siempre."
+        )
+
+    if any(keyword in folded for keyword in ("recordas", "acordas", "tenes info", "tenes datos")):
+        retriever = MemoryRetriever(session)
+        chunks = retriever.retrieve(normalized, tags=tags, chat_id=chat_id, limit=5)
+        if not chunks:
+            return AgentResult(reply_text="No tengo info registrada sobre eso.")
+        summary = " ".join(_format_chunk_summary(chunks))
+        return AgentResult(reply_text=f"Tengo registrado: {summary}")
+
+    return None
+
+
+def _calendar_auth_missing() -> bool:
+    try:
+        return not CalendarTool().has_token()
+    except Exception:
+        return True
+
+
+def _handle_calendar_auth_needed(session, chat_id: str) -> str:
+    now_local = datetime.now(TIMEZONE)
+    detector = NeedsDetector(session)
+    detector.scan(chat_id, now_local, user_text="calendario", intent_hint={"calendar_intent": True})
+    request = _get_request_by_key(session, "authorize_calendar", "calendar_auth", chat_id)
+    prompt = _ask_request_if_allowed(session, request, now_local)
+    if prompt:
+        return prompt
+    session.commit()
+    return _auth_message()
+
+
+def _maybe_ask_request(
+    session,
+    state: ConversationState,
+    chat_id: str,
+    normalized: str,
+) -> str | None:
+    if state.pending_action_json or state.pending_question_json:
+        return None
+    if get_active_request(session, chat_id):
+        return None
+    if _should_skip_request_prompt(normalized):
+        now_local = datetime.now(TIMEZONE)
+        detector = NeedsDetector(session)
+        detector.scan(chat_id, now_local, user_text=normalized, intent_hint=None)
+        session.commit()
+        return None
+
+    now_local = datetime.now(TIMEZONE)
+    detector = NeedsDetector(session)
+    detector.scan(chat_id, now_local, user_text=normalized, intent_hint=None)
+
+    open_requests = get_open_requests(session, chat_id, limit=5)
+    for request in open_requests:
+        prompt = _ask_request_if_allowed(session, request, now_local)
+        if prompt:
+            return prompt
+
+    session.commit()
+    return None
+
+
+def _should_skip_request_prompt(text: str) -> bool:
+    folded = _fold_text(text)
+    if not folded:
+        return True
+    greetings = {"hola", "buenas", "buen dia", "buenas tardes", "buenas noches", "ok"}
+    if folded in greetings:
+        return True
+    return len(folded.split()) <= 1
+
+
+def _ask_request_if_allowed(
+    session, request, now_local: datetime
+) -> str | None:
+    if request is None:
+        return None
+
+    config = _get_or_create_config(session)
+    autonomy_mode, _ = _get_autonomy_mode(session)
+    day_start = datetime.combine(now_local.date(), time(0, 0), tzinfo=TIMEZONE)
+    day_end = day_start + timedelta(days=1)
+    asked_today = count_requests_asked_today(session, day_start, day_end)
+    policy = RequestPolicy()
+    if policy.should_ask(request, now_local, autonomy_mode, config, asked_today):
+        mark_request_asked(session, request, now_local)
+        session.commit()
+        return request.prompt
+    return None
+
+
+def _get_request_by_key(session, request_type: str, key: str, chat_id: str):
+    dedupe_key = f"{request_type}:{key}:{chat_id}"
+    return session.query(AssistantRequest).filter_by(dedupe_key=dedupe_key).one_or_none()
+
+
+def _find_fact_for_tags(session, tags: list[str]) -> MemoryFact | None:
+    for tag in tags:
+        if tag == "peluqueria":
+            fact = (
+                session.query(MemoryFact)
+                .filter(
+                    MemoryFact.subject == "user",
+                    MemoryFact.key == "default_barbershop",
+                    MemoryFact.confidence >= 70,
+                )
+                .one_or_none()
+            )
+            if fact:
+                return fact
+        for key in (f"{tag}_default", f"{tag}_lugar"):
+            fact = (
+                session.query(MemoryFact)
+                .filter(
+                    MemoryFact.subject == "user",
+                    MemoryFact.key == key,
+                    MemoryFact.confidence >= 70,
+                )
+                .one_or_none()
+            )
+            if fact:
+                return fact
+    return None
+
+
+def _tag_label(tag: str) -> str:
+    labels = {
+        "peluqueria": "peluqueria",
+        "fletes": "servicio de fletes",
+        "camionetas": "camioneta",
+        "ascend": "dietetica",
+        "agenda": "agenda",
+    }
+    return labels.get(tag, tag)
+
+
+def _format_chunk_summary(chunks) -> list[str]:
+    summaries: list[str] = []
+    for chunk in chunks:
+        content = chunk.content.strip().replace("\n", " ")
+        if len(content) > 120:
+            content = content[:117] + "..."
+        summaries.append(f"[{chunk.source_type}] {content}")
+    return summaries
+
+
+def _handle_llm_planner(
+    session,
+    state: ConversationState,
+    user_text: str,
+    chat_id: str,
+) -> AgentResult | None:
+    if not _should_use_llm(user_text):
+        return None
+    context = ContextBuilder(session).build(chat_id, user_text, intent_hint=None)
+    config = _get_or_create_config(session)
+    llm_client = LlmClient(load_llm_config(config))
+    planner_output = llm_client.generate_structured(
+        _build_llm_system_prompt(),
+        user_text,
+        context.prompt,
+    )
+    state.last_intent = planner_output.intent
+
+    decision = Supervisor(context.autonomy_snapshot, context.evidence_keys).evaluate(
+        planner_output, chat_id
+    )
+
+    if decision.requires_confirmation and decision.action:
+        action = decision.action
+        if action.tool == "calendar.create_event":
+            payload = {
+                "title": action.input.get("title"),
+                "start": action.input.get("start"),
+                "end": action.input.get("end"),
+                "location": action.input.get("location"),
+                "notes": action.input.get("notes"),
+                "timezone": TIMEZONE.key,
+            }
+            state.pending_action_json = {"type": "calendar_create", "payload": payload}
+            state.pending_question_json = None
+            state.last_intent = "llm_plan"
+            session.commit()
+        return AgentResult(reply_text=decision.reply)
+
+    if decision.action and not decision.requires_confirmation:
+        action = decision.action
+        tool_scope = get_tool_scope(action.tool) or "unknown"
+        audit_context = {
+            "decision_source": "supervisor",
+            "requested_by": "llm",
+            "risk_level": action.risk_level,
+            "autonomy_mode_snapshot": context.autonomy_snapshot,
+        }
+        calendar_tool = CalendarTool(log_runs=False, audit_context=audit_context)
+        status = "success"
+        output_json: dict[str, Any] | list = {}
+        try:
+            output_json = execute_tool(action.tool, action.input, calendar_tool=calendar_tool)
+        except Exception as exc:
+            status = "error"
+            output_json = {"error": exc.__class__.__name__}
+
+        _log_tool_run(
+            session,
+            tool_name=action.tool,
+            status=status,
+            input_json=action.input,
+            output_json=output_json,
+            decision_source="supervisor",
+            requested_by="llm",
+            risk_level=action.risk_level,
+            autonomy_snapshot=context.autonomy_snapshot,
+        )
+
+        reply = decision.reply or "Listo."
+        if status != "success":
+            reply = "No pude completar la accion."
+        if action.tool == "calendar.create_event" and isinstance(output_json, dict):
+            link = output_json.get("htmlLink")
+            if link:
+                reply = f"{reply} {link}"
+        session.commit()
+        return AgentResult(reply_text=reply)
+
+    if decision.reply:
+        session.commit()
+        return AgentResult(reply_text=decision.reply)
+    return None
+
+
+def _should_use_llm(text: str) -> bool:
+    folded = _fold_text(text)
+    if not folded:
+        return False
+    greetings = {"hola", "buenas", "buen dia", "buenas tardes", "buenas noches"}
+    if folded in greetings:
+        return False
+    if len(folded.split()) <= 1:
+        return False
+    keywords = (
+        "agend",
+        "agenda",
+        "crear",
+        "evento",
+        "calendario",
+        "recorda",
+        "recordar",
+        "turno",
+        "necesito",
+        "queres",
+        "pod",
+    )
+    return any(keyword in folded for keyword in keywords)
+
+
+def _log_tool_run(
+    session,
+    tool_name: str,
+    status: str,
+    input_json: dict[str, Any] | list,
+    output_json: dict[str, Any] | list,
+    decision_source: str,
+    requested_by: str,
+    risk_level: str,
+    autonomy_snapshot: dict,
+) -> None:
+    run = ToolRun(
+        tool_name=tool_name,
+        status=status,
+        input_json=input_json,
+        output_json=output_json,
+        decision_source=decision_source,
+        requested_by=requested_by,
+        risk_level=risk_level,
+        autonomy_mode_snapshot=autonomy_snapshot,
+    )
+    session.add(run)
+    session.commit()
+
+
+def _build_llm_system_prompt() -> str:
+    tool_list = ", ".join(sorted(get_tool_names()))
+    return (
+        "Sos un planner que responde SOLO JSON estricto. "
+        "No agregues texto extra.\n"
+        f"Herramientas permitidas: {tool_list}.\n"
+        "Schema:\n"
+        "{"
+        "\"intent\": \"...\", "
+        "\"reply\": \"...\", "
+        "\"questions\": [\"...\"] , "
+        "\"actions\": [{\"tool\":\"...\",\"input\":{},\"risk_level\":\"low|medium|high\",\"rationale\":\"...\",\"requires_confirmation\":false}], "
+        "\"evidence_needed\": [\"...\"]"
+        "}\n"
+        "Reglas: max 1 pregunta, max 3 acciones. Usa evidencia si es necesaria."
+    )
+
+
+def _build_proactive_status(session) -> str:
+    config = _get_or_create_config(session)
+    mode, until_at = _get_autonomy_mode(session)
+    mode_label = {
+        "normal": "normal",
+        "focus": "foco",
+        "urgencies_only": "solo urgencias",
+    }.get(mode, mode)
+
+    parts = [f"Modo proactivo: {mode_label}.", f"Limite diario: {config.daily_proactive_limit}."]
+    if mode == "focus" and until_at:
+        remaining = until_at - datetime.now(timezone.utc)
+        if remaining.total_seconds() > 0:
+            hours = int(remaining.total_seconds() // 3600)
+            minutes = int((remaining.total_seconds() % 3600) // 60)
+            parts.append(f"Foco restante: {hours}h {minutes}m.")
+    return " ".join(parts)
+
+
+def _build_autonomy_status(session) -> str:
+    now_utc = datetime.now(timezone.utc)
+    scopes = ["calendar_create", "message_reply", "tasks_manage"]
+    lines = []
+    for scope in scopes:
+        rule = (
+            session.query(AutonomyRule)
+            .filter(AutonomyRule.scope == scope)
+            .order_by(AutonomyRule.created_at.desc())
+            .first()
+        )
+        if rule and rule.until_at and rule.until_at < now_utc:
+            status = "off"
+            remaining = None
+        elif rule:
+            status = rule.mode
+            remaining = rule.until_at
+        else:
+            status = "off"
+            remaining = None
+        if remaining:
+            delta = remaining - now_utc
+            hours = int(delta.total_seconds() // 3600)
+            minutes = int((delta.total_seconds() % 3600) // 60)
+            lines.append(f"{scope}: {status} ({hours}h {minutes}m)")
+        else:
+            lines.append(f"{scope}: {status}")
+    return "Autonomia: " + ", ".join(lines)
+
+
+def _parse_autonomy_scope(folded: str) -> str | None:
+    if "calendario" in folded:
+        return "calendar_create"
+    if "mensaje" in folded or "mensajes" in folded:
+        return "message_reply"
+    if "tarea" in folded or "tareas" in folded:
+        return "tasks_manage"
+    return None
+
+
+def _get_or_create_config(session) -> SystemConfig:
+    config = session.query(SystemConfig).order_by(SystemConfig.id.asc()).first()
+    if config:
+        return config
+    config = SystemConfig(
+        quiet_hours_start=time(0, 0),
+        quiet_hours_end=time(9, 30),
+        strong_window_start=time(11, 0),
+        strong_window_end=time(19, 0),
+        daily_proactive_limit=5,
+        maybe_cooldown_minutes=240,
+        urgent_threshold=80,
+        maybe_threshold=50,
+        llm_provider="ollama",
+        llm_base_url=os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434"),
+        llm_model_name="qwen2.5:7b-instruct-q4",
+        llm_temperature=0.3,
+        llm_max_tokens=512,
+        llm_json_mode=True,
+    )
+    session.add(config)
+    session.commit()
+    return config
+
+
+def _get_autonomy_mode(session) -> tuple[str, datetime | None]:
+    rules = (
+        session.query(AutonomyRule)
+        .filter(AutonomyRule.scope == "global")
+        .order_by(AutonomyRule.created_at.desc())
+        .all()
+    )
+    now_utc = datetime.now(timezone.utc)
+    for rule in rules:
+        if rule.until_at and rule.until_at < now_utc:
+            continue
+        return rule.mode, rule.until_at
+    return "normal", None

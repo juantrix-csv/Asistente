@@ -10,3 +10,5 @@ google-auth
 google-auth-oauthlib
 cryptography
 tzdata
+APScheduler
+pgvector

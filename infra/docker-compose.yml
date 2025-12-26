@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   db:
-    image: postgres:15
+    image: pgvector/pgvector:pg15
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
@@ -34,6 +34,9 @@ services:
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/auth/google/callback}
       SECRET_KEY: ${SECRET_KEY:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      EMBEDDINGS_MODE: ${EMBEDDINGS_MODE:-off}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-all-MiniLM-L6-v2}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     depends_on:
       db:
         condition: service_healthy
@@ -54,6 +57,37 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  worker:
+    build:
+      context: ..
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      WAHA_BASE_URL: ${WAHA_BASE_URL:-http://waha:3000}
+      WAHA_API_KEY: ${WAHA_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/auth/google/callback}
+      SECRET_KEY: ${SECRET_KEY:-}
+      PROACTIVE_CHAT_ID: ${PROACTIVE_CHAT_ID:-}
+      USER_CHAT_ID: ${USER_CHAT_ID:-}
+      EMBEDDINGS_MODE: ${EMBEDDINGS_MODE:-off}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-all-MiniLM-L6-v2}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      [
+        "sh",
+        "-c",
+        "python -m apps.api.app.wait_for_db && python -m apps.worker.app.main",
+      ]
 
   waha:
     image: devlikeapro/waha:latest

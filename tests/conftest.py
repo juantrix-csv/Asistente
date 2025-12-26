@@ -27,7 +27,7 @@ def clean_db() -> None:
     with SessionLocal() as session:
         session.execute(
             text(
-                "TRUNCATE TABLE messages_raw, contacts, conversation_state, autonomy_rules, secrets, tool_runs RESTART IDENTITY"
+                "TRUNCATE TABLE messages_raw, contacts, conversation_state, autonomy_rules, secrets, tool_runs, proactive_events, digests, system_config, tasks, memory_chunks, assistant_notes, memory_facts, assistant_requests, assistant_request_events RESTART IDENTITY"
             )
         )
         session.commit()

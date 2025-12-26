@@ -23,8 +23,15 @@ class CalendarNotAuthorized(RuntimeError):
 
 
 class CalendarTool:
-    def __init__(self, calendar_id: str = "primary") -> None:
+    def __init__(
+        self,
+        calendar_id: str = "primary",
+        log_runs: bool = True,
+        audit_context: dict[str, Any] | None = None,
+    ) -> None:
         self.calendar_id = calendar_id
+        self.log_runs = log_runs
+        self.audit_context = audit_context or {}
 
     def list_events(self, time_min: datetime, time_max: datetime) -> list[dict[str, Any]]:
         input_payload = {
@@ -54,6 +61,7 @@ class CalendarTool:
                     or event.get("start", {}).get("date"),
                     "end": event.get("end", {}).get("dateTime")
                     or event.get("end", {}).get("date"),
+                    "location": event.get("location"),
                     "htmlLink": event.get("htmlLink"),
                 }
                 for event in events
@@ -147,12 +155,18 @@ class CalendarTool:
     def _log_tool_run(
         self, tool_name: str, input_json: dict[str, Any], output_json: dict[str, Any], status: str
     ) -> None:
+        if not self.log_runs:
+            return
         with SessionLocal() as session:
             run = ToolRun(
                 tool_name=tool_name,
                 status=status,
                 input_json=input_json,
                 output_json=output_json,
+                decision_source=self.audit_context.get("decision_source"),
+                requested_by=self.audit_context.get("requested_by"),
+                risk_level=self.audit_context.get("risk_level"),
+                autonomy_mode_snapshot=self.audit_context.get("autonomy_mode_snapshot"),
             )
             session.add(run)
             session.commit()
