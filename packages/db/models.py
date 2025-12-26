@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, Integer, Text, Time, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Integer, Text, Time, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
@@ -32,6 +32,14 @@ class Contact(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     chat_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trust_level: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
+    trust_label: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_interaction_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    preferred_channel: Mapped[str] = mapped_column(Text, nullable=False, default="whatsapp")
+    allow_auto_reply: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -167,6 +175,73 @@ class Task(Base):
     )
 
 
+class Habit(Base):
+    __tablename__ = "habits"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schedule_type: Mapped[str] = mapped_column(Text, nullable=False)
+    target_per_week: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    days_of_week: Mapped[list[int] | None] = mapped_column(ARRAY(Integer), nullable=True)
+    window_start: Mapped[time] = mapped_column(Time, nullable=False)
+    window_end: Mapped[time] = mapped_column(Time, nullable=False)
+    min_version_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class HabitLog(Base):
+    __tablename__ = "habit_logs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    habit_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("habits.id"), nullable=False, index=True
+    )
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class HabitNudge(Base):
+    __tablename__ = "habit_nudges"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    habit_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("habits.id"), nullable=False, index=True
+    )
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    strategy: Mapped[str] = mapped_column(Text, nullable=False)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    decision: Mapped[str] = mapped_column(Text, nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class CoachingProfile(Base):
+    __tablename__ = "coaching_profile"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    intensity: Mapped[str] = mapped_column(Text, nullable=False, default="medium")
+    style: Mapped[str] = mapped_column(Text, nullable=False, default="formal")
+    preferred_times: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    what_works: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class MemoryChunk(Base):
     __tablename__ = "memory_chunks"
 
@@ -211,6 +286,53 @@ class MemoryFact(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class ConversationThread(Base):
+    __tablename__ = "conversation_threads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    contact_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("contacts.id"), nullable=False, index=True
+    )
+    channel: Mapped[str] = mapped_column(Text, nullable=False, default="whatsapp")
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    topic: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class ConversationEvent(Base):
+    __tablename__ = "conversation_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    thread_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("conversation_threads.id"), nullable=False, index=True
+    )
+    direction: Mapped[str] = mapped_column(Text, nullable=False)
+    message_raw_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("messages_raw.id"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    extracted: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PrivacyRule(Base):
+    __tablename__ = "privacy_rules"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    rule_name: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class AssistantRequest(Base):

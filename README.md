@@ -83,7 +83,8 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/auth/google/finish -Co
 - Cooldown por trigger y rate limit diario (config en `system_config`).
 - Digest diario a las 21:00 con items digeridos (max 10).
 - Usa `USER_CHAT_ID` si esta definido (fallback a `PROACTIVE_CHAT_ID` o ultimo contacto).
- - El digest incluye una seccion "Para mejorar" con requests abiertos de alta prioridad.
+- El digest incluye una seccion "Para mejorar" con requests abiertos de alta prioridad.
+- Aviso por conversaciones pendientes: si un thread queda en `waiting_me` por >3h (cliente/proveedor).
 
 Comandos por WhatsApp:
 - `modo foco X horas` / `no me jodas X horas`
@@ -136,6 +137,43 @@ Requests actuales:
 
 Endpoints:
 - `GET /requests?status=open` para ver requests.
+
+## Relaciones y conversaciones (Bloque 10)
+Comandos para contactos:
+- `contacto <nombre/chat_id> es proveedor|cliente|amigo|inner`
+- `subi confianza <nombre/chat_id> a 70`
+- `auto-reply on <nombre/chat_id>`
+- `auto-reply off <nombre/chat_id>`
+
+Privacidad:
+- Regla `no_share_address`: no compartir direcciones personales sin confirmacion.
+- Regla `no_share_payment`: no compartir datos de pago sin confirmacion.
+
+Threads:
+- Se crean por contacto y canal (WhatsApp).
+- Estados: `open`, `waiting_them`, `waiting_me`, `closed`.
+- Trigger proactivo: aviso si queda en `waiting_me` mas de 3h.
+
+## Habitos y coaching (Bloque 11)
+Comandos:
+- `crear habito <texto>`
+- `mis habitos`
+- `hecho <habito>`
+- `no hoy <habito>`
+- `estado habitos`
+- `resumen habitos`
+- `desactivar habito <nombre>`
+- `subi intensidad`
+- `baja intensidad`
+- `no me jodas con habitos hoy`
+
+Proactividad:
+- Nudges cuando la ventana esta por cerrar, riesgo de racha y riesgo semanal.
+- Respeta quiet hours, modo foco y limite diario.
+- Digest diario incluye una seccion de habitos.
+
+LLM (opcional):
+- `HABIT_NUDGE_USE_LLM=1` para usar el LLM local en la redaccion de nudges.
 
 ## Migraciones
 Con la DB levantada, podes ejecutar:

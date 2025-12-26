@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from packages.agent_core.tools.calendar_tool import CalendarTool
+from packages.relations.message_tools import build_reply_draft
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,16 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         scope="calendar_create",
         description="Chequear disponibilidad en un rango",
     ),
+    "message.reply_draft": ToolSpec(
+        name="message.reply_draft",
+        scope="message_reply",
+        description="Generar borrador de respuesta a un contacto",
+    ),
+    "message.send": ToolSpec(
+        name="message.send",
+        scope="message_reply",
+        description="Enviar mensaje por WhatsApp",
+    ),
 }
 
 
@@ -51,6 +62,10 @@ def validate_tool_input(tool_name: str, tool_input: dict[str, Any]) -> list[str]
         return _missing_fields(tool_input, ["time_min", "time_max"])
     if tool_name == "calendar.is_free":
         return _missing_fields(tool_input, ["start", "end"])
+    if tool_name == "message.reply_draft":
+        return _missing_fields(tool_input, ["incoming_text"])
+    if tool_name == "message.send":
+        return _missing_fields(tool_input, ["chat_id", "text"])
     return []
 
 
@@ -58,6 +73,7 @@ def execute_tool(
     tool_name: str,
     tool_input: dict[str, Any],
     calendar_tool: CalendarTool | None = None,
+    message_sender: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     tool = calendar_tool or CalendarTool()
     if tool_name == "calendar.create_event":
@@ -85,6 +101,19 @@ def execute_tool(
         if start is None or end is None:
             raise ValueError("Missing start/end")
         return {"is_free": tool.is_free(start, end)}
+    if tool_name == "message.reply_draft":
+        incoming_text = str(tool_input.get("incoming_text", ""))
+        contact_name = tool_input.get("contact_name")
+        return {"draft": build_reply_draft(incoming_text, contact_name)}
+    if tool_name == "message.send":
+        if not message_sender:
+            raise ValueError("Missing message_sender")
+        chat_id = tool_input.get("chat_id")
+        text = tool_input.get("text")
+        if not chat_id or not text:
+            raise ValueError("Missing chat_id/text")
+        response = message_sender(chat_id, text)
+        return {"response": response}
     raise ValueError(f"Unknown tool {tool_name}")
 
 

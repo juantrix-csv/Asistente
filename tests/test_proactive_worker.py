@@ -10,7 +10,7 @@ from apps.worker.app.proactive import (
 )
 from packages.agent_core.core import handle_incoming_message
 from packages.db.database import SessionLocal
-from packages.db.models import AutonomyRule, ProactiveEvent, SystemConfig, Task
+from packages.db.models import AutonomyRule, Contact, ConversationThread, ProactiveEvent, SystemConfig, Task
 
 
 class _FakeCalendarTool:
@@ -210,3 +210,37 @@ def test_status_proactivo_command() -> None:
 
     assert "Modo proactivo" in reply.reply_text
     assert "Limite diario" in reply.reply_text
+
+
+def test_thread_waiting_me_triggers_notice(monkeypatch) -> None:
+    monkeypatch.setenv("USER_CHAT_ID", "123@c.us")
+    now = datetime(2025, 1, 1, 12, 0, tzinfo=TIMEZONE)
+
+    with SessionLocal() as session:
+        contact = Contact(chat_id="prov@c.us", display_name="Proveedor", trust_label="provider", trust_level=70)
+        session.add(contact)
+        session.commit()
+        thread = ConversationThread(
+            contact_id=contact.id,
+            status="waiting_me",
+            last_message_at=now - timedelta(hours=4),
+            last_summary="Pregunta por horarios",
+        )
+        session.add(thread)
+        session.commit()
+
+    sent = {}
+
+    def fake_send(self, chat_id: str, text: str) -> dict:
+        sent["chat_id"] = chat_id
+        sent["text"] = text
+        return {"messageId": "fake"}
+
+    monkeypatch.setattr(
+        "apps.api.app.services.waha_client.WahaClient.send_text", fake_send
+    )
+
+    run_proactive_tick(now=now, calendar_tool=_FakeCalendarTool([]))
+
+    assert sent["chat_id"] == "123@c.us"
+    assert "pendiente responder" in sent["text"].lower()

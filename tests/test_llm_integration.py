@@ -31,7 +31,9 @@ def test_llm_executes_calendar_action(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         "packages.agent_core.core.execute_tool",
-        lambda tool_name, tool_input, calendar_tool=None: {"htmlLink": "http://example.com"},
+        lambda tool_name, tool_input, calendar_tool=None, message_sender=None: {
+            "htmlLink": "http://example.com"
+        },
     )
 
     reply = handle_incoming_message(

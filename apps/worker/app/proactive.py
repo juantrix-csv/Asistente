@@ -20,12 +20,21 @@ from packages.db.models import (
     AssistantRequest,
     AutonomyRule,
     Contact,
+    ConversationThread,
     Digest,
+    Habit,
+    HabitLog,
+    HabitNudge,
     MemoryFact,
     ProactiveEvent,
     SystemConfig,
     Task,
 )
+from packages.habits.engine import HabitEngine, get_or_create_coaching_profile, record_nudge_sent
+from packages.habits.nudges import build_nudge_message
+from packages.habits.selector import NudgeStrategySelector
+from packages.llm.client import load_llm_config
+from packages.llm.text_client import TextLlmClient
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +43,10 @@ LOOKAHEAD_MINUTES = 120
 TASK_DUE_SOON_MINUTES = 120
 TASK_HIGH_PRIORITY = 3
 REQUEST_DIGEST_MIN_PRIORITY = 70
+THREAD_WAITING_HOURS = 3
+HABIT_WINDOW_GRACE_MINUTES = 60
+HABIT_STREAK_DAYS = 2
+HABIT_PRIORITY_HIGH = 4
 
 DEFAULT_CONFIG = {
     "quiet_hours_start": time(0, 0),
@@ -62,6 +75,7 @@ class Candidate:
     priority: int | None
     dedupe_key: str
     message: str
+    strategy: str | None = None
 
 
 @dataclass
@@ -75,6 +89,7 @@ def run_proactive_tick(
     now: datetime | None = None,
     calendar_tool: CalendarTool | None = None,
     waha_client: WahaClient | None = None,
+    llm_client: TextLlmClient | None = None,
     session_factory=SessionLocal,
 ) -> int:
     current_time = _ensure_timezone(now or datetime.now(TIMEZONE))
@@ -90,6 +105,8 @@ def run_proactive_tick(
         candidates = []
         candidates.extend(_calendar_candidates(tool, current_time))
         candidates.extend(_task_candidates(session, current_time))
+        candidates.extend(_thread_waiting_candidates(session, current_time))
+        candidates.extend(_habit_candidates(session, current_time, config, llm_client))
         candidates.sort(key=lambda item: item.score, reverse=True)
 
         for candidate in candidates:
@@ -110,6 +127,10 @@ def run_proactive_tick(
                 sent_today,
                 in_cooldown,
             )
+
+            if candidate.trigger_type.startswith("habit_"):
+                if _habits_autonomy_off(session, current_time):
+                    decision = Decision("suppressed", "habits_off", decision.score)
 
             if decision.decision == "sent":
                 if not chat_id:
@@ -146,6 +167,7 @@ def run_proactive_tick(
                     sent_at=current_time,
                     created_at=current_time,
                 )
+                _record_habit_nudge(session, candidate, decision.decision, current_time)
                 sent_today += 1
                 sent_count += 1
                 continue
@@ -158,6 +180,7 @@ def run_proactive_tick(
                 sent_at=None,
                 created_at=current_time,
             )
+            _record_habit_nudge(session, candidate, decision.decision, current_time)
 
     return sent_count
 
@@ -194,11 +217,12 @@ def run_daily_digest(
             return 0
 
         request_lines = _build_request_digest_lines(session, chat_id)
-        if not events and not request_lines:
+        habit_lines = _build_habit_digest_lines(session, current_time)
+        if not events and not request_lines and not habit_lines:
             return 0
 
         lines = _build_digest_lines(session, events, day_start, day_end, calendar_tool)
-        content = _format_digest_message(lines, request_lines)
+        content = _format_digest_message(lines, request_lines, habit_lines)
 
         client = waha_client or WahaClient()
         sent_at = None
@@ -363,6 +387,152 @@ def _task_candidates(session, now: datetime) -> list[Candidate]:
     return candidates
 
 
+def _habit_candidates(
+    session,
+    now: datetime,
+    config: SystemConfig,
+    llm_client: TextLlmClient | None = None,
+) -> list[Candidate]:
+    engine = HabitEngine(session)
+    habits = engine.list_habits(active_only=True)
+    if not habits:
+        return []
+    if llm_client is None and os.getenv("HABIT_NUDGE_USE_LLM", "1") == "1":
+        llm_client = TextLlmClient(load_llm_config(config))
+    profile = get_or_create_coaching_profile(session)
+    selector = NudgeStrategySelector(profile)
+    candidates: list[Candidate] = []
+    today = now.date()
+
+    for habit in habits:
+        if engine.habit_status_today(habit.id, today):
+            continue
+        if not engine.is_due_today(habit, now):
+            continue
+
+        trigger_type, trigger_bonus = _habit_trigger(habit, session, now)
+        if not trigger_type:
+            continue
+
+        last_nudge = (
+            session.query(HabitNudge)
+            .filter(HabitNudge.habit_id == habit.id)
+            .order_by(HabitNudge.ts.desc())
+            .first()
+        )
+        choice = selector.select(habit, last_nudge)
+        score = min(95, choice.score + trigger_bonus)
+
+        message = build_nudge_message(habit, choice.strategy, profile, llm_client)
+        dedupe_key = f"habit:{habit.id}:{trigger_type}:{today.isoformat()}"
+        candidates.append(
+            Candidate(
+                trigger_type=trigger_type,
+                entity_id=str(habit.id),
+                title=habit.name,
+                score=score,
+                priority=habit.priority,
+                dedupe_key=dedupe_key,
+                message=message,
+                strategy=choice.strategy,
+            )
+        )
+
+    return candidates
+
+
+def _habit_trigger(
+    habit: Habit,
+    session,
+    now: datetime,
+) -> tuple[str | None, int]:
+    if habit.priority and habit.priority >= HABIT_PRIORITY_HIGH:
+        last_done = _last_done_date(session, habit.id)
+        if last_done is None or (now.date() - last_done).days >= HABIT_STREAK_DAYS:
+            return "habit_streak_risk", 10
+
+    if habit.schedule_type == "weekly" and habit.target_per_week:
+        if _weekly_target_in_risk(session, habit, now):
+            return "habit_weekly_risk", 5
+
+    if _window_closing(habit, now):
+        return "habit_window", 0
+
+    return None, 0
+
+
+def _window_closing(habit: Habit, now: datetime) -> bool:
+    window_end = datetime.combine(now.date(), habit.window_end, tzinfo=TIMEZONE)
+    window_start = datetime.combine(now.date(), habit.window_start, tzinfo=TIMEZONE)
+    if now < window_start or now > window_end:
+        return False
+    remaining = window_end - now
+    return remaining <= timedelta(minutes=HABIT_WINDOW_GRACE_MINUTES)
+
+
+def _last_done_date(session, habit_id: int) -> date | None:
+    log = (
+        session.query(HabitLog)
+        .filter(HabitLog.habit_id == habit_id, HabitLog.status.in_(["done", "partial"]))
+        .order_by(HabitLog.date.desc())
+        .first()
+    )
+    return log.date if log else None
+
+
+def _weekly_target_in_risk(session, habit: Habit, now: datetime) -> bool:
+    week_start = now.date() - timedelta(days=now.date().weekday())
+    week_end = week_start + timedelta(days=7)
+    done_count = (
+        session.query(HabitLog)
+        .filter(
+            HabitLog.habit_id == habit.id,
+            HabitLog.date >= week_start,
+            HabitLog.date < week_end,
+            HabitLog.status.in_(["done", "partial"]),
+        )
+        .count()
+    )
+    remaining_days = (week_end - now.date()).days
+    remaining_possible = max(0, remaining_days)
+    return habit.target_per_week > done_count + remaining_possible
+
+
+def _thread_waiting_candidates(session, now: datetime) -> list[Candidate]:
+    threshold = now - timedelta(hours=THREAD_WAITING_HOURS)
+    threads = (
+        session.query(ConversationThread, Contact)
+        .join(Contact, ConversationThread.contact_id == Contact.id)
+        .filter(
+            ConversationThread.status == "waiting_me",
+            ConversationThread.last_message_at <= threshold,
+            Contact.trust_label.in_(["client", "provider", "cliente", "proveedor"]),
+        )
+        .all()
+    )
+    candidates: list[Candidate] = []
+    for thread, contact in threads:
+        contact_name = contact.display_name or contact.chat_id
+        summary = thread.last_summary or "sin resumen"
+        dedupe_key = f"thread_waiting_me:{thread.id}:{thread.last_message_at.isoformat()}"
+        message = (
+            f"Tenes pendiente responder a {contact_name}: {summary}. "
+            "Queres que redacte respuesta?"
+        )
+        candidates.append(
+            Candidate(
+                trigger_type="thread_waiting_me",
+                entity_id=str(thread.id),
+                title=contact_name,
+                score=80,
+                priority=None,
+                dedupe_key=dedupe_key,
+                message=message,
+            )
+        )
+    return candidates
+
+
 def _build_digest_lines(
     session,
     events: Iterable[ProactiveEvent],
@@ -372,20 +542,42 @@ def _build_digest_lines(
 ) -> list[str]:
     calendar_map = _calendar_digest_map(calendar_tool, day_start, day_end)
     task_ids: list[int] = []
+    thread_ids: list[int] = []
     for event in events:
         if event.trigger_type != "task_due_today" or not event.entity_id:
-            continue
-        try:
-            task_ids.append(int(event.entity_id))
-        except ValueError:
-            continue
+            pass
+        else:
+            try:
+                task_ids.append(int(event.entity_id))
+            except ValueError:
+                pass
+        if event.trigger_type == "thread_waiting_me" and event.entity_id:
+            try:
+                thread_ids.append(int(event.entity_id))
+            except ValueError:
+                pass
     task_map = {}
     if task_ids:
         rows = session.query(Task).filter(Task.id.in_(task_ids)).all()
         task_map = {task.id: task.title for task in rows}
 
+    thread_map: dict[int, str] = {}
+    if thread_ids:
+        rows = (
+            session.query(ConversationThread, Contact)
+            .join(Contact, ConversationThread.contact_id == Contact.id)
+            .filter(ConversationThread.id.in_(thread_ids))
+            .all()
+        )
+        for thread, contact in rows:
+            name = contact.display_name or contact.chat_id
+            summary = thread.last_summary or "sin resumen"
+            thread_map[thread.id] = f"Pendiente: {name} ({summary})"
+
     lines: list[str] = []
     for event in events:
+        if event.trigger_type.startswith("habit_"):
+            continue
         if event.trigger_type == "calendar_upcoming":
             label = calendar_map.get(event.entity_id or "", f"Evento: {event.entity_id}")
         elif event.trigger_type == "task_due_today":
@@ -396,6 +588,13 @@ def _build_digest_lines(
                 except ValueError:
                     title = None
             label = f"Tarea: {title or event.entity_id}"
+        elif event.trigger_type == "thread_waiting_me":
+            label = "Pendiente: conversacion"
+            if event.entity_id:
+                try:
+                    label = thread_map.get(int(event.entity_id), label)
+                except ValueError:
+                    pass
         else:
             label = f"{event.trigger_type}: {event.entity_id}"
         lines.append(label)
@@ -427,7 +626,9 @@ def _calendar_digest_map(
     return mapping
 
 
-def _format_digest_message(lines: list[str], request_lines: list[str]) -> str:
+def _format_digest_message(
+    lines: list[str], request_lines: list[str], habit_lines: list[str]
+) -> str:
     visible = lines[:10]
     message_lines = ["Resumen de hoy:"]
     for line in visible:
@@ -438,6 +639,10 @@ def _format_digest_message(lines: list[str], request_lines: list[str]) -> str:
     if request_lines:
         message_lines.append("Para mejorar:")
         for line in request_lines:
+            message_lines.append(f"- {line}")
+    if habit_lines:
+        message_lines.append("Habitos:")
+        for line in habit_lines[:5]:
             message_lines.append(f"- {line}")
     return "\n".join(message_lines)
 
@@ -460,6 +665,22 @@ def _build_request_digest_lines(session, chat_id: str) -> list[str]:
         if line:
             lines.append(line)
     return lines
+
+
+def _build_habit_digest_lines(session, now: datetime) -> list[str]:
+    engine = HabitEngine(session)
+    if not engine.list_habits(active_only=True):
+        return []
+    summary = engine.daily_summary(now)
+    done = ", ".join(summary["done"]) or "-"
+    pending = ", ".join(summary["pending"]) or "-"
+    streaks = ", ".join(summary["streaks"]) or "-"
+    lines = [
+        f"Cumplidos: {done}",
+        f"Pendientes: {pending}",
+        f"Rachas: {streaks}",
+    ]
+    return lines[:5]
 
 
 def _request_digest_label(request: AssistantRequest) -> str:
@@ -584,12 +805,57 @@ def _record_event(
         session.rollback()
 
 
+def _record_habit_nudge(
+    session,
+    candidate: Candidate,
+    decision: str,
+    now: datetime,
+) -> None:
+    if not candidate.trigger_type.startswith("habit_"):
+        return
+    if not candidate.strategy:
+        strategy = "micro_action"
+    else:
+        strategy = candidate.strategy
+    try:
+        habit_id = int(candidate.entity_id)
+    except ValueError:
+        return
+    record = HabitNudge(
+        habit_id=habit_id,
+        ts=now,
+        strategy=strategy,
+        score=candidate.score,
+        decision=decision,
+        message_text=candidate.message,
+    )
+    session.add(record)
+    if decision == "sent":
+        record_nudge_sent(session, strategy)
+    session.commit()
+
+
 def _in_quiet_hours(local_time: time, config: SystemConfig) -> bool:
     return config.quiet_hours_start <= local_time < config.quiet_hours_end
 
 
 def _in_strong_window(local_time: time, config: SystemConfig) -> bool:
     return config.strong_window_start <= local_time < config.strong_window_end
+
+
+def _habits_autonomy_off(session, now_local: datetime) -> bool:
+    rules = (
+        session.query(AutonomyRule)
+        .filter(AutonomyRule.scope == "habits")
+        .order_by(AutonomyRule.created_at.desc())
+        .all()
+    )
+    now_utc = now_local.astimezone(timezone.utc)
+    for rule in rules:
+        if rule.until_at and rule.until_at < now_utc:
+            continue
+        return rule.mode != "on"
+    return False
 
 
 def _parse_event_start(value: object | None) -> datetime | None:

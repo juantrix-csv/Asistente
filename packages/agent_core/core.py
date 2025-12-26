@@ -25,7 +25,9 @@ from packages.db.database import SessionLocal
 from packages.db.models import (
     AssistantRequest,
     AutonomyRule,
+    Contact,
     ConversationState,
+    Habit,
     MemoryFact,
     SystemConfig,
     ToolRun,
@@ -36,6 +38,12 @@ from packages.llm.supervisor import Supervisor
 from packages.llm.tools_registry import execute_tool, get_tool_scope, get_tool_names
 from packages.memory.service import MemoryRetriever
 from packages.memory.tagger import extract_tags
+from packages.habits.engine import HabitEngine, get_or_create_coaching_profile
+from packages.habits.parsing import parse_habit_text
+from packages.relations.contact_handler import send_contact_reply
+from packages.relations.message_tools import send_message_and_store
+from packages.relations.policy import ContactPolicy
+from packages.relations.trust import TrustEngine
 
 TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 
@@ -91,6 +99,14 @@ def handle_incoming_message(
         focus_result = _handle_focus_commands(session, state, folded)
         if focus_result:
             return focus_result
+
+        contact_result = _handle_contact_commands(session, folded)
+        if contact_result:
+            return contact_result
+
+        habit_result = _handle_habit_commands(session, folded, normalized)
+        if habit_result:
+            return habit_result
 
         if state.pending_question_json:
             pending_result = _handle_pending_question(session, state, normalized)
@@ -463,6 +479,42 @@ def _confirm_pending_action(
         return None
 
     action_type = pending.get("type")
+    if action_type == "message_send":
+        payload = pending.get("payload") or {}
+        contact_chat_id = payload.get("chat_id")
+        thread_id = payload.get("thread_id")
+        text = payload.get("text")
+        if not contact_chat_id or not text:
+            state.pending_action_json = None
+            session.commit()
+            return AgentResult(reply_text="No pude enviar el mensaje. Reintenta.")
+
+        success = False
+        if thread_id:
+            outbound_kind = "question" if "?" in text else "info"
+            success = send_contact_reply(thread_id, contact_chat_id, text, outbound_kind)
+        else:
+            _message_id, _response, error = send_message_and_store(contact_chat_id, text)
+            success = error is None
+        _log_tool_run(
+            session,
+            tool_name="message.send",
+            status="success" if success else "error",
+            input_json={"chat_id": contact_chat_id, "text": text},
+            output_json={"sent": success},
+            decision_source="user",
+            requested_by="user",
+            risk_level="medium",
+            autonomy_snapshot={},
+        )
+        state.pending_action_json = None
+        state.pending_question_json = None
+        state.last_intent = "message_send"
+        session.commit()
+        if success:
+            return AgentResult(reply_text="Listo, mensaje enviado.")
+        return AgentResult(reply_text="No pude enviar el mensaje.")
+
     if action_type != "calendar_create":
         state.pending_action_json = None
         session.commit()
@@ -561,7 +613,9 @@ def _handle_focus_commands(
         session.commit()
         return AgentResult(reply_text=reply)
 
-    if folded.startswith("modo foco") or folded.startswith("no me jodas"):
+    if folded.startswith("modo foco") or (
+        folded.startswith("no me jodas") and "habitos" not in folded
+    ):
         hours = _parse_int(folded)
         if hours is None:
             state.pending_question_json = {"type": "focus_hours"}
@@ -842,6 +896,248 @@ def _handle_memory_request(
     return None
 
 
+def _handle_contact_commands(
+    session,
+    folded: str | None,
+) -> AgentResult | None:
+    if not folded:
+        return None
+
+    match = re.match(r"^contacto\s+(.+?)\s+es\s+(proveedor|cliente|amigo|inner)\b", folded)
+    if match:
+        identifier = match.group(1).strip()
+        label = match.group(2).strip()
+        contact = _find_contact(session, identifier)
+        if contact is None:
+            return AgentResult(reply_text="No encontre ese contacto. Usa el chat_id.")
+        TrustEngine().apply_label(contact, label)
+        session.commit()
+        return AgentResult(reply_text=f"Listo, {identifier} ahora es {label}.")
+
+    match = re.match(r"^subi confianza\s+(.+?)\s+a\s+(\d{1,3})\b", folded)
+    if match:
+        identifier = match.group(1).strip()
+        level = int(match.group(2))
+        contact = _find_contact(session, identifier)
+        if contact is None:
+            return AgentResult(reply_text="No encontre ese contacto. Usa el chat_id.")
+        TrustEngine().set_level(contact, level)
+        session.commit()
+        return AgentResult(reply_text=f"Confianza actualizada para {identifier}.")
+
+    match = re.match(r"^auto[-\s]?reply\s+on\s+(.+)$", folded)
+    if match:
+        identifier = match.group(1).strip()
+        contact = _find_contact(session, identifier)
+        if contact is None:
+            return AgentResult(reply_text="No encontre ese contacto. Usa el chat_id.")
+        TrustEngine().set_auto_reply(contact, True)
+        session.commit()
+        return AgentResult(reply_text=f"Auto-reply activado para {identifier}.")
+
+    match = re.match(r"^auto[-\s]?reply\s+off\s+(.+)$", folded)
+    if match:
+        identifier = match.group(1).strip()
+        contact = _find_contact(session, identifier)
+        if contact is None:
+            return AgentResult(reply_text="No encontre ese contacto. Usa el chat_id.")
+        TrustEngine().set_auto_reply(contact, False)
+        session.commit()
+        return AgentResult(reply_text=f"Auto-reply desactivado para {identifier}.")
+
+    return None
+
+
+def _handle_habit_commands(
+    session,
+    folded: str | None,
+    normalized: str,
+) -> AgentResult | None:
+    if not folded:
+        return None
+
+    if folded == "mis habitos":
+        engine = HabitEngine(session)
+        habits = engine.list_habits(active_only=True)
+        if not habits:
+            return AgentResult(reply_text="No tenes habitos activos.")
+        lines = ["Habitos activos:"]
+        for habit in habits:
+            lines.append(f"- {habit.name} ({_format_habit_schedule(habit)})")
+        return AgentResult(reply_text="\n".join(lines))
+
+    if folded == "estado habitos":
+        engine = HabitEngine(session)
+        summary = engine.daily_summary(datetime.now(TIMEZONE))
+        done = ", ".join(summary["done"]) or "-"
+        pending = ", ".join(summary["pending"]) or "-"
+        streaks = ", ".join(summary["streaks"]) or "-"
+        reply = (
+            f"Hoy:\n- Cumplidos: {done}\n- Pendientes: {pending}\n- Rachas: {streaks}"
+        )
+        return AgentResult(reply_text=reply)
+
+    if folded == "resumen habitos":
+        engine = HabitEngine(session)
+        lines = engine.weekly_report(datetime.now(TIMEZONE))
+        if not lines:
+            return AgentResult(reply_text="No tenes habitos registrados.")
+        reply_lines = ["Resumen semanal:"]
+        reply_lines.extend(f"- {line}" for line in lines)
+        return AgentResult(reply_text="\n".join(reply_lines))
+
+    if folded == "subi intensidad":
+        profile = get_or_create_coaching_profile(session)
+        profile.intensity = _shift_intensity(profile.intensity, direction="up")
+        session.commit()
+        return AgentResult(reply_text=f"Intensidad actual: {profile.intensity}.")
+
+    if folded == "baja intensidad":
+        profile = get_or_create_coaching_profile(session)
+        profile.intensity = _shift_intensity(profile.intensity, direction="down")
+        session.commit()
+        return AgentResult(reply_text=f"Intensidad actual: {profile.intensity}.")
+
+    if folded == "no me jodas con habitos hoy":
+        end_of_day = datetime.combine(datetime.now(TIMEZONE).date(), time(23, 59), tzinfo=TIMEZONE)
+        session.add(
+            AutonomyRule(scope="habits", mode="off", until_at=end_of_day.astimezone(timezone.utc))
+        )
+        session.commit()
+        return AgentResult(reply_text="Ok, hoy no te voy a insistir con habitos.")
+
+    if folded.startswith("crear habito "):
+        raw_name = _extract_after_words(normalized, 2)
+        if not raw_name:
+            return AgentResult(reply_text="Decime el nombre del habito.")
+        schedule_info = parse_habit_text(raw_name)
+        name = _clean_habit_name(raw_name)
+        if not name:
+            return AgentResult(reply_text="Decime el nombre del habito.")
+        engine = HabitEngine(session)
+        existing = engine.find_habits_by_name(name, active_only=False)
+        if any(habit.name.lower() == name.lower() for habit in existing):
+            return AgentResult(reply_text="Ese habito ya existe.")
+        config = _get_or_create_config(session)
+        min_version = _default_min_version(name)
+        habit = engine.create_habit(
+            name=name,
+            description=None,
+            schedule_type=str(schedule_info["schedule_type"]),
+            target_per_week=schedule_info.get("target_per_week"),
+            days_of_week=schedule_info.get("days_of_week"),
+            window_start=config.strong_window_start,
+            window_end=config.strong_window_end,
+            min_version_text=min_version,
+            priority=3,
+            active=True,
+        )
+        session.commit()
+        return AgentResult(reply_text=f"Listo, cree el habito: {habit.name}.")
+
+    if folded.startswith("desactivar habito "):
+        name = _extract_after_words(normalized, 2)
+        habit, error = _resolve_habit(session, name)
+        if error:
+            return AgentResult(reply_text=error)
+        habit.active = False
+        session.commit()
+        return AgentResult(reply_text=f"Habito desactivado: {habit.name}.")
+
+    if folded.startswith("hecho "):
+        name = _extract_after_words(normalized, 1)
+        habit, error = _resolve_habit(session, name)
+        if error:
+            return AgentResult(reply_text=error)
+        engine = HabitEngine(session)
+        engine.log_done(habit.id, now=datetime.now(TIMEZONE))
+        streak = engine.current_streak(habit.id, datetime.now(TIMEZONE))
+        session.commit()
+        return AgentResult(reply_text=f"Listo, registre {habit.name}. Racha: {streak}d.")
+
+    if folded.startswith("no hoy "):
+        name = _extract_after_words(normalized, 2)
+        habit, error = _resolve_habit(session, name)
+        if error:
+            return AgentResult(reply_text=error)
+        engine = HabitEngine(session)
+        engine.log_skip(habit.id, now=datetime.now(TIMEZONE))
+        session.commit()
+        return AgentResult(reply_text=f"Ok, marcado como no hoy: {habit.name}.")
+
+    return None
+
+
+def _resolve_habit(session, name: str | None) -> tuple[Habit | None, str | None]:
+    if not name:
+        return None, "Decime el habito."
+    engine = HabitEngine(session)
+    matches = engine.find_habits_by_name(name)
+    if not matches:
+        return None, "No encontre ese habito."
+    if len(matches) > 1:
+        names = ", ".join(habit.name for habit in matches[:5])
+        return None, f"Hay varios: {names}. Decime cual."
+    return matches[0], None
+
+
+def _extract_after_words(text: str, words: int) -> str | None:
+    parts = text.split()
+    if len(parts) <= words:
+        return None
+    return " ".join(parts[words:]).strip()
+
+
+def _format_habit_schedule(habit) -> str:
+    if habit.schedule_type == "weekly" and habit.target_per_week:
+        return f"{habit.target_per_week} por semana"
+    if habit.schedule_type == "scheduled" and habit.days_of_week:
+        labels = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]
+        days = ",".join(labels[idx] for idx in habit.days_of_week if idx < len(labels))
+        return f"{days}"
+    return "diario"
+
+
+def _default_min_version(name: str) -> str:
+    return f"{name} 5 min"
+
+
+def _clean_habit_name(text: str) -> str:
+    cleaned = re.sub(r"\b\d+\s*veces\s*por\s*semana\b", "", text, flags=re.I)
+    cleaned = re.sub(
+        r"\b(lunes|martes|miercoles|jueves|viernes|sabado|domingo|lun|mar|mie|jue|vie|sab|dom)\b",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    return " ".join(cleaned.split()).strip()
+
+
+def _shift_intensity(value: str, direction: str) -> str:
+    levels = ["low", "medium", "high"]
+    current = value if value in levels else "medium"
+    idx = levels.index(current)
+    if direction == "up" and idx < len(levels) - 1:
+        return levels[idx + 1]
+    if direction == "down" and idx > 0:
+        return levels[idx - 1]
+    return current
+
+
+def _find_contact(session, identifier: str) -> Contact | None:
+    if "@" in identifier:
+        return session.query(Contact).filter_by(chat_id=identifier).one_or_none()
+
+    matches = (
+        session.query(Contact)
+        .filter(Contact.display_name.ilike(f"%{identifier}%"))
+        .all()
+    )
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def _calendar_auth_missing() -> bool:
     try:
         return not CalendarTool().has_token()
@@ -994,9 +1290,11 @@ def _handle_llm_planner(
     )
     state.last_intent = planner_output.intent
 
-    decision = Supervisor(context.autonomy_snapshot, context.evidence_keys).evaluate(
-        planner_output, chat_id
-    )
+    decision = Supervisor(
+        context.autonomy_snapshot,
+        context.evidence_keys,
+        contact_policy=ContactPolicy(session),
+    ).evaluate(planner_output, chat_id)
 
     if decision.requires_confirmation and decision.action:
         action = decision.action
@@ -1013,6 +1311,11 @@ def _handle_llm_planner(
             state.pending_question_json = None
             state.last_intent = "llm_plan"
             session.commit()
+        if action.tool == "message.send":
+            state.pending_action_json = {"type": "message_send", "payload": action.input}
+            state.pending_question_json = None
+            state.last_intent = "llm_plan"
+            session.commit()
         return AgentResult(reply_text=decision.reply)
 
     if decision.action and not decision.requires_confirmation:
@@ -1025,10 +1328,21 @@ def _handle_llm_planner(
             "autonomy_mode_snapshot": context.autonomy_snapshot,
         }
         calendar_tool = CalendarTool(log_runs=False, audit_context=audit_context)
+        thread_id = action.input.get("thread_id")
+        message_sender = lambda dest_chat_id, text: (
+            {"sent": send_contact_reply(thread_id, dest_chat_id, text, "info")}
+            if thread_id
+            else _send_and_return(dest_chat_id, text)
+        )
         status = "success"
         output_json: dict[str, Any] | list = {}
         try:
-            output_json = execute_tool(action.tool, action.input, calendar_tool=calendar_tool)
+            output_json = execute_tool(
+                action.tool,
+                action.input,
+                calendar_tool=calendar_tool,
+                message_sender=message_sender,
+            )
         except Exception as exc:
             status = "error"
             output_json = {"error": exc.__class__.__name__}
@@ -1059,6 +1373,15 @@ def _handle_llm_planner(
         session.commit()
         return AgentResult(reply_text=decision.reply)
     return None
+
+
+def _send_and_return(chat_id: str, text: str) -> dict[str, Any]:
+    message_id, response, error = send_message_and_store(chat_id, text)
+    if error:
+        return {"error": error}
+    if response is None:
+        return {"message_id": message_id}
+    return response
 
 
 def _should_use_llm(text: str) -> bool:

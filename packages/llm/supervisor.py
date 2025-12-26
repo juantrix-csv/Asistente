@@ -17,9 +17,15 @@ class SupervisorDecision:
 
 
 class Supervisor:
-    def __init__(self, autonomy_snapshot: dict, evidence_keys: Iterable[str]) -> None:
+    def __init__(
+        self,
+        autonomy_snapshot: dict,
+        evidence_keys: Iterable[str],
+        contact_policy: object | None = None,
+    ) -> None:
         self.autonomy_snapshot = autonomy_snapshot
         self.evidence_keys = {key.lower() for key in evidence_keys}
+        self.contact_policy = contact_policy
 
     def evaluate(self, output: PlannerOutput, chat_id: str) -> SupervisorDecision:
         if output.questions:
@@ -68,6 +74,32 @@ class Supervisor:
                 requires_confirmation=False,
                 reason="missing_evidence",
             )
+
+        if action.tool == "message.send":
+            if not _autonomy_enabled(self.autonomy_snapshot, tool_scope):
+                return SupervisorDecision(
+                    reply=output.reply or "Necesito confirmacion.",
+                    action=action,
+                    requires_confirmation=True,
+                    reason="autonomy_off",
+                )
+            chat_id = action.input.get("chat_id")
+            text = action.input.get("text", "")
+            if not chat_id or not self.contact_policy:
+                return SupervisorDecision(
+                    reply=output.reply or "Necesito confirmacion.",
+                    action=action,
+                    requires_confirmation=True,
+                    reason="missing_contact_context",
+                )
+            allow, _reason = self.contact_policy.allow_auto_send(chat_id, text)
+            if not allow:
+                return SupervisorDecision(
+                    reply=output.reply or "Necesito confirmacion.",
+                    action=action,
+                    requires_confirmation=True,
+                    reason="contact_policy",
+                )
 
         if action.risk_level == "high":
             return SupervisorDecision(
