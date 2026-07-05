@@ -43,12 +43,12 @@ Chain strategy: stacked-to-main
 
 ## Phase 2: Core Personal
 
-- [ ] 2.1 Write `skills/padrino-soul/SKILL.md` — identity, 5 modes (normal/firme/crisis/enfoque/finanzas), approval gate rules, tone (voseo, no guilt, fact-vs-inference)
-- [ ] 2.2 Write `sql/schema.sql` and `scripts/migrate.sh` — 17 tables (tasks, projects, goals, habits, habit_entries, transactions, budgets, savings_goals, debts, memories, memories_fts, decisions, daily_checkins, reminders, audit_runs, audit_findings, audit_log), indexes, triggers, schema_version
-- [ ] 2.3 Write `skills/padrino-inbox/SKILL.md` — LLM classifier for 12 types, confidence >0.8 auto-route, <0.8 ask user, `/inbox` command handler
-- [ ] 2.4 Write `skills/padrino-memory/SKILL.md` — capture with metadata (source/confidence/type/validity), FTS5 recall, journal append-only with timestamp, corrections via confirmation, `/recordar` command
-- [ ] 2.5 Write `skills/padrino-tasks/SKILL.md` — 8-status lifecycle with valid transitions, project CRUD, goal tracking with progress, reminders, `/tareas` `/proyecto` `/meta` commands
-- [ ] 2.6 Create `memory/USER.md` and `memory/MEMORY.md` — YAML frontmatter with area/project stubs, blank sections for facts/preferences/decisions
+- [x] 2.1 Write `skills/padrino-soul/SKILL.md` — identity, 5 modes (normal/firme/crisis/enfoque/finanzas), approval gate rules, tone (voseo, no guilt, fact-vs-inference)
+- [x] 2.2 Write `sql/001_initial_schema.sql` and `scripts/migrate.sh` — 17 tables (tasks, projects, goals, habits, habit_entries, transactions, budgets, savings_goals, debts, memories, memories_fts, decisions, daily_checkins, reminders, audit_runs, audit_findings, audit_log), indexes, triggers, schema_version
+- [x] 2.3 Write `skills/padrino-inbox/SKILL.md` — LLM classifier for 13 types, confidence ≥80% auto-route, <80% ask user, `/inbox` command handler
+- [x] 2.4 Write `skills/padrino-memory/SKILL.md` — capture with metadata (source/confidence/type/validity), FTS5 recall, journal append-only with timestamp, corrections via confirmation, `/recordar` command
+- [x] 2.5 Write `skills/padrino-tasks/SKILL.md` — 8-status lifecycle with valid transitions, project CRUD, goal tracking with progress, reminders, `/tareas` `/proyecto` `/meta` commands
+- [x] 2.6 Create memory templates — USER.md, MEMORY.md, preferences.md, goals.md, current_context.md + 5 area files + 5 project files
 
 ## Phase 3: Planning & Discipline
 
