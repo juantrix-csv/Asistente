@@ -1,0 +1,20 @@
+# Repo Allowlist — Padrino Digital Code Auditor
+# =============================================================================
+# Format: one HTTPS repository URL per line (no trailing slash).
+# Lines starting with '#' are comments. Blank lines are ignored.
+#
+# The code auditor ONLY clones repos listed here.
+# Requests for unlisted repos are rejected and logged as security events.
+#
+# To add a repo:
+#   1. Verify you have read access to the repo
+#   2. Add the full HTTPS URL below
+#   3. The auditor will learn about it on the next invocation
+#
+# =============================================================================
+# Authorized repositories
+# =============================================================================
+
+# Example (uncomment and replace with your own repos):
+# https://github.com/juantrix-csv/nexios-backend
+# https://github.com/juantrix-csv/Ascend-frontend
