@@ -1,0 +1,69 @@
+# =============================================================================
+# Padrino Digital — Scheduled Cron Jobs
+# =============================================================================
+# Timezone: America/Argentina/Buenos_Aires (ART = UTC-3)
+# Ensure TZ=America/Argentina/Buenos_Aires is set in ~/.hermes/.env
+#
+# Installation:
+#   crontab -u padrino padrino/cron/padrino-crons.txt
+#
+# Verification:
+#   crontab -u padrino -l
+#
+# Each job is self-contained — it queries the database directly and does NOT
+# rely on conversational context. Deduplication guards prevent double delivery.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Morning Summary — 08:00 ART (11:00 UTC)
+# ---------------------------------------------------------------------------
+# Delivers: top 3 priorities, today's commitments, overdue tasks, financial
+#           reminders, and minimum mode status.
+# Dedup:    Checks daily_checkins table for morning_delivered flag.
+0 8 * * * hermes cron create "Generá el resumen matutino para hoy ($(date +\%Y-\%m-\%d)). Consultá la base de datos padrino.db en /srv/padrino/data/: (1) SELECT de tasks con status IN ('todo','in_progress','overdue') ordenadas por priority DESC, due_at ASC LIMIT 5. (2) SELECT de daily_checkins WHERE date = today() para ver si hay check-in y si está en modo mínimo. (3) SELECT de reminders WHERE remind_at entre hoy y mañana. (4) SELECT de transactions WHERE date = today() para recordar gastos de ayer. (5) SELECT de budgets para verificar alertas de presupuesto. NO uses contexto de conversación previa — esta consulta es autocontenida. Si ya existe un registro en daily_checkins con morning_delivered=1 para hoy, NO generes el resumen (ya fue enviado). Formateá el mensaje para Telegram con secciones claras: Prioridades, Compromisos, Recordatorios, Finanzas. Si el modo mínimo está activo, mostrá solo 2 prioridades." --name "padrino-morning" --deliver telegram
+
+# ---------------------------------------------------------------------------
+# Evening Review — 21:30 ART (00:30 UTC next day)
+# ---------------------------------------------------------------------------
+# Delivers: completed tasks today, pending tasks rolled over, main obstacle
+#           prompt, unregistered expenses prompt, next-day preparation notes.
+# Dedup:    Checks daily_checkins table for evening_delivered flag.
+30 21 * * * hermes cron create "Generá la revisión nocturna para hoy ($(date +\%Y-\%m-\%d)). Consultá la base de datos padrino.db: (1) SELECT de tasks WHERE status cambiado a 'done' hoy. (2) SELECT de tasks WHERE status IN ('todo','in_progress') y due_at era hoy o antes. (3) SELECT de daily_checkins WHERE date = today() para ver qué se planeó. (4) SELECT de transactions WHERE date = today() para ver gastos registrados. Si hay 0 gastos registrados hoy, preguntá: '¿Tuviste algún gasto hoy que no hayamos registrado?'. Preguntá: '¿Cuál fue el principal obstáculo hoy?'. Sugerí las prioridades de mañana basadas en tareas pendientes. NO uses contexto de conversación previa. Si ya existe evening_delivered=1 en daily_checkins para hoy, NO generes la revisión." --name "padrino-evening" --deliver telegram
+
+# ---------------------------------------------------------------------------
+# Weekly Review — Sunday 19:00 ART (22:00 UTC)
+# ---------------------------------------------------------------------------
+# Delivers: achievements, completed tasks count, postponed patterns, stalled
+#           projects, habit compliance table, financial summary, problems
+#           detected, recommendations, next-week priorities.
+# Dedup:    Checks audit_log for weekly_review_delivered with current year+week.
+0 19 * * 0 hermes cron create "Generá la revisión semanal completa para la semana actual (W$(date +\%V) del $(date +\%Y)). Consultá la base de datos padrino.db: (1) SELECT de tasks completadas esta semana (status='done', updated_at >= inicio de semana). (2) SELECT de tasks pateadas (snooze_count > 1). (3) SELECT de projects sin actividad en 7+ días (stalled). (4) SELECT de habit_entries agrupadas por habit_id para esta semana, calculá compliance %. (5) SELECT de transactions de esta semana: ingresos vs gastos por categoría. (6) SELECT de budgets con warning activo. (7) SELECT de savings_goals y debts para progreso. (8) SELECT de audit_log para eventos de seguridad. Estructurá el mensaje: Logros, Tareas (completadas/pendientes/pateadas), Proyectos estancados, Hábitos (tabla de compliance), Finanzas (ingresos/gastos/alertas), Problemas detectados, Recomendaciones, Prioridades próxima semana. Si no hay datos para una sección, decí 'Sin datos esta semana'. NO uses contexto de conversación previa. Dedup: verificá que no haya weekly_review_delivered para el par (año, semana) en audit_log." --name "padrino-weekly" --deliver telegram
+
+# ---------------------------------------------------------------------------
+# Monthly Review — 1st of month 10:00 ART (13:00 UTC)
+# ---------------------------------------------------------------------------
+# Delivers: financial evolution by area, goal progress, active projects with
+#           pause candidates, habit trends (4-week table), debt status, savings
+#           progress, decisions review, month-over-month comparison table.
+# Dedup:    Checks audit_log for monthly_review_delivered with current year+month.
+0 10 1 * * hermes cron create "Generá la revisión mensual completa para $(date +\%B) del $(date +\%Y). Consultá la base de datos padrino.db: (1) SELECT de transactions del mes actual y del mes anterior, agrupá por type y business_area para comparación mes-a-mes (delta y porcentaje). (2) SELECT de goals con progreso (current_value / target_value). (3) SELECT de projects activos y candidatos a pausar (sin actividad en 30+ días). (4) SELECT de habit_entries de las últimas 4 semanas, agrupá por habit_id y semana para tabla de tendencias. (5) SELECT de debts con remaining_amount y pagos del mes. (6) SELECT de savings_goals con progreso. (7) SELECT de decisions creadas o actualizadas este mes. (8) SELECT de budget performance: gastos vs límites por categoría. Estructurá el mensaje: Evolución Financiera (tabla comparativa mes anterior vs actual), Metas (progreso), Proyectos (activos y candidatos a pausa), Hábitos (tabla 4 semanas), Deudas (estado), Ahorros (progreso), Decisiones del mes, Presupuesto (alertas). Incluí siempre el disclaimer: 'Estos números son informativos, no constituyen asesoramiento financiero.'. NO uses contexto de conversación previa. Dedup: verificá que no haya monthly_review_delivered para (año, mes) en audit_log." --name "padrino-monthly" --deliver telegram
+
+# ---------------------------------------------------------------------------
+# Daily Backup — 03:00 ART (06:00 UTC)
+# ---------------------------------------------------------------------------
+# Runs the encrypted backup script. Alerts only on failure or anomaly.
+# Dedup:    Timestamp check in audit_log.
+0 3 * * * /srv/padrino/scripts/backup.sh
+
+# =============================================================================
+# Installation Notes
+# =============================================================================
+# 1. Copy to VPS:  scp padrino/cron/padrino-crons.txt user@vps:/tmp/
+# 2. Install:      crontab -u padrino /tmp/padrino-crons.txt
+# 3. Verify:       crontab -u padrino -l
+# 4. Check logs:   tail -f /srv/padrino/logs/cron.log
+#
+# The hermes cron create commands expect Hermes Agent v0.18.0+ with the
+# `hermes cron` subcommand available. If using an older version, replace
+# with: hermes -p padrino chat -q "{prompt}" --deliver telegram
+# =============================================================================
