@@ -1,0 +1,60 @@
+# Command Allowlist — Padrino Digital Security
+# =============================================================================
+# Format: one command per line. The first token on each line is the allowed
+# command name. Optional: additional accepted arguments after the command.
+# Lines starting with '#' are comments. Blank lines are ignored.
+#
+# Padrino Digital only executes commands listed here.
+# Any command NOT in this list is rejected and logged as a security event.
+#
+# Rules:
+#   - Commands are matched by first token (argv[0])
+#   - Additional tokens on the same line specify allowed arguments/subcommands
+#   - Use '*' as wildcard to allow any arguments (use with extreme caution)
+# =============================================================================
+
+# Version control (read-only)
+git clone --depth 1 *
+git log *
+git diff *
+git show *
+git status
+
+# Database
+sqlite3 *
+
+# File operations (read-only paths enforced separately)
+cat *
+ls *
+stat *
+find *
+wc *
+head *
+tail *
+grep *
+
+# Archives and checksums
+tar czf *
+tar xzf *
+sha256sum *
+sha256sum -c *
+
+# Encryption (symmetric only, no key generation)
+gpg --symmetric --batch *
+gpg --decrypt *
+gpg --verify *
+
+# System info
+date
+uptime
+free
+df
+
+# Hermes CLI
+hermes gateway
+hermes -p *
+hermes --version
+
+# Python
+python3 *
+pip3 install *

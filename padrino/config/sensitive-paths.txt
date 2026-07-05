@@ -1,0 +1,48 @@
+# Sensitive Paths — Padrino Digital Security
+# =============================================================================
+# Format: one absolute path per line. Shell wildcards (*/?) are supported.
+# Lines starting with '#' are comments. Blank lines are ignored.
+#
+# Padrino Digital NEVER reads, writes, or accesses ANY path on this list.
+# Attempted access is denied and logged as a security event.
+#
+# This list is ENFORCED at the skill layer (padrino-security/SKILL.md),
+# NOT at the OS level — but the OS-level padrino user also has no access
+# to these paths through standard Unix permissions.
+# =============================================================================
+
+# System files
+/etc/shadow
+/etc/passwd
+/etc/sudoers
+/etc/sudoers.d/*
+/root/*
+/boot/*
+
+# SSH keys (private)
+/etc/ssh/ssh_host_*_key
+/home/*/.ssh/id_*
+~/.ssh/id_*
+
+# Secrets (including Hermes)
+~/.hermes/secrets.env
+~/.hermes/.env
+~/.hermes_auditor/.env
+**/secrets.env
+**/.env
+
+# System logs (readable via journald, not direct)
+/var/log/auth.log*
+/var/log/syslog*
+
+# Other users home dirs
+/home/*
+!/home/padrino/*
+
+# Temporary (Hermes-managed /tmp/ limited scope)
+/tmp/*
+!/tmp/hermes-*
+
+# Docker/snap (out of scope)
+/var/lib/docker/*
+/snap/*
