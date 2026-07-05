@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes Gateway - Padrino Digital
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=padrino
+Group=padrino
+ExecStart=/home/padrino/.local/bin/hermes gateway
+Restart=on-failure
+RestartSec=10
+Environment="HOME=/home/padrino"
+Environment="PATH=/home/padrino/.local/bin:/usr/local/bin:/usr/bin:/bin"
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/padrino /home/padrino/.hermes
+
+[Install]
+WantedBy=multi-user.target
