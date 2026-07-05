@@ -52,13 +52,13 @@ Chain strategy: stacked-to-main
 
 ## Phase 3: Planning & Discipline
 
-- [ ] 3.1 Write `skills/padrino-plan/SKILL.md` — multi-criteria ranking (due/priority/impact/snooze/energy), cap 3 priorities, overload detection, provisional plan when availability unknown, minimum-mode cap 2, `/plan` `/hoy` commands
-- [ ] 3.2 Write `skills/padrino-coach/SKILL.md` — habit tracking with weekly compliance %, 3x-snooze escalation, 7-day stall detection, load-reduction recommend at <40%, minimum mode activation, `/habito` `/modo minimo` commands
-- [ ] 3.3 Write `skills/padrino-review/SKILL.md` — daily checkin (energy, available_hours), evening aggregation (completed/pending/obstacle/expenses prompt), weekly/monthly synthesis across all data skills
+- [x] 3.1 Write `skills/padrino-plan/SKILL.md` — multi-criteria ranking (due/priority/impact/snooze/energy), cap 3 priorities, overload detection, provisional plan when availability unknown, minimum-mode cap 2, `/plan` `/hoy` commands
+- [x] 3.2 Write `skills/padrino-coach/SKILL.md` — habit tracking with weekly compliance %, 3x-snooze escalation, 7-day stall detection, load-reduction recommend at <40%, minimum mode activation, `/habito` `/modo minimo` commands
+- [x] 3.3 Write `skills/padrino-review/SKILL.md` — daily checkin (energy, available_hours), evening aggregation (completed/pending/obstacle/expenses prompt), weekly/monthly synthesis across all data skills
 
 ## Phase 4: Finances
 
-- [ ] 4.1 Write `skills/padrino-finance/SKILL.md` — transaction recording (expense/income/transfer/adjustment) with approval gate, budget tracking with % warnings, savings goals, debt monitoring, 7 finance rules enforcement, currency conversion with metadata, correction audit trail via reversal entries, ARS export, `/finanzas` `/gasto` `/presupuesto` commands
+- [x] 4.1 Write `skills/padrino-finance/SKILL.md` — transaction recording (expense/income/transfer/adjustment) with approval gate, budget tracking with % warnings, savings goals, debt monitoring, 7 finance rules enforcement, currency conversion with metadata, correction audit trail via reversal entries, ARS export, `/finanzas` `/gasto` `/presupuesto` commands
 
 ## Phase 5: Code Auditor
 
