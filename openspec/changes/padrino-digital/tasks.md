@@ -62,15 +62,15 @@ Chain strategy: stacked-to-main
 
 ## Phase 5: Code Auditor
 
-- [ ] 5.1 Write `skills/padrino-audit/SKILL.md` — `/auditar` command: allowlist check, `git clone --depth 1` read-only, detect lang/framework, diff from last `audit_runs.commit_hash`, analyze changed files, generate findings (severity/confidence/evidence/impact/reproduction), write `OpenCode_TASKS.md`
-- [ ] 5.2 Create `auditor-profile/` skeleton — `SOUL.md` (minimal auditor persona, no Telegram), `.env` (read-only git tokens, 600 ref), `config.yaml`
-- [ ] 5.3 Write `scripts/audit-repo.sh` — CLI wrapper: `hermes -p auditor chat -q "audit repo $1"`, validates URL against allowlist before invoking Hermes
+- [x] 5.1 Write `skills/padrino-audit/SKILL.md` — `/auditar` command: allowlist check, `git clone --depth 1` read-only, detect lang/framework, diff from last `audit_runs.commit_hash`, analyze changed files, generate findings (severity/confidence/evidence/impact/reproduction), write `OpenCode_TASKS.md`
+- [x] 5.2 Create `auditor-profile/` skeleton — `SOUL.md` (minimal auditor persona, no Telegram), `.env` (read-only git tokens, 600 ref), `config.yaml`
+- [x] 5.3 Write `scripts/audit-repo.sh` — CLI wrapper: `hermes -p auditor chat -q "audit repo $1"`, validates URL against allowlist before invoking Hermes
 
 ## Phase 6: Robustness
 
-- [ ] 6.1 Write `skills/padrino-backup/SKILL.md` — daily backup: tar.gz → sha256sum → gpg encrypt (AES-256, `PADRINO_BACKUP_KEY`), restore: checksum verify → decrypt → `integrity_check`, healthcheck (size anomaly, recovery alert), `/backup` `/restaurar` commands
-- [ ] 6.2 Write `skills/padrino-security/SKILL.md` — path write enforcement via allowlist, command execution allowlist, `audit_log` append-only mutations, rate limiting on sensitive ops
-- [ ] 6.3 Write `scripts/backup.sh`, `restore.sh`, `export.sh` — backup/restore workflow wrappers with confirmation prompts, finance CSV export
-- [ ] 6.4 Create `cron/padrino-crons.txt` — 5 jobs: morning summary (0 8 * * *), evening review (30 21 * * *), weekly (0 19 * * 0), monthly (0 10 1 * *), daily backup (0 3 * * *); all self-contained prompts per design
-- [ ] 6.5 Write `scripts/test.sh` — integration smoke tests: DB schema applied, SKILL.md files parse (all 11), healthcheck passes, backup round-trip (create + restore + verify)
-- [ ] 6.6 Write `docs/` suite — `README.md`, `ARCHITECTURE.md`, `INSTALL.md`, `SECURITY.md`, `USER_GUIDE.md`, `SKILL_CATALOG.md`
+- [x] 6.1 Write `skills/padrino-backup/SKILL.md` — daily backup: tar.gz → sha256sum → gpg encrypt (AES-256, `PADRINO_BACKUP_KEY`), restore: checksum verify → decrypt → `integrity_check`, healthcheck (size anomaly, recovery alert), `/backup` `/restaurar` commands
+- [x] 6.2 Write `skills/padrino-security/SKILL.md` — path write enforcement via allowlist, command execution allowlist, `audit_log` append-only mutations, rate limiting on sensitive ops
+- [x] 6.3 Write `scripts/backup.sh`, `restore.sh`, `export.sh` — backup/restore workflow wrappers with confirmation prompts, finance CSV export
+- [x] 6.4 Create `cron/padrino-crons.txt` — 5 jobs: morning summary (0 8 * * *), evening review (30 21 * * *), weekly (0 19 * * 0), monthly (0 10 1 * *), daily backup (0 3 * * *); all self-contained prompts per design
+- [x] 6.5 Write `scripts/test.sh` — integration smoke tests: DB schema applied, SKILL.md files parse (all 12), healthcheck passes, backup round-trip (create + restore + verify)
+- [x] 6.6 Write `docs/` suite — `README.md`, `ARCHITECTURE.md`, `INSTALLATION.md`, `CONFIGURATION.md`, `TELEGRAM_SETUP.md`, `MEMORY_MODEL.md`, `TASK_SYSTEM.md`, `FINANCE_SYSTEM.md`, `DISCIPLINE_SYSTEM.md`, `CODE_AUDITOR.md`, `SECURITY.md`, `BACKUP_AND_RESTORE.md`, `OPERATIONS.md`, `TROUBLESHOOTING.md`, `USER_GUIDE.md`, `NEXT_STEPS.md`, `SKILL_CATALOG.md`
